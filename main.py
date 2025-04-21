@@ -79,14 +79,15 @@ def main():
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
         
-    # Create configuration
-    config = Config(
-        codebase_path=os.path.abspath(args.codebase_path),
-        report_format=args.report_format,
-        output_dir=os.path.abspath(args.output_dir),
-        knowledge_base_path=os.path.abspath(args.knowledge_base),
-        llm_provider=args.llm_provider
-    )
+    # Create configuration - Using singleton pattern correctly
+    config = Config()
+    
+    # Set properties on the config object
+    config.codebase_path = os.path.abspath(args.codebase_path)
+    config.report_format = args.report_format
+    config.output_dir = os.path.abspath(args.output_dir)
+    config.knowledge_base_path = os.path.abspath(args.knowledge_base)
+    config.llm_provider = args.llm_provider
     
     # Run the audit asynchronously
     asyncio.run(run_audit(config))
