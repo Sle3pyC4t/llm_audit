@@ -69,6 +69,10 @@ class SchedulingCenter:
             tool_center=self.tool_center
         )
         
+        # Provide each agent with a reference to the scheduler for inter-agent communication
+        for name, agent in self.agents.items():
+            agent.scheduler = self
+        
         logger.info(f"Initialized {len(self.agents)} agents")
     
     async def start_audit(self):
@@ -82,9 +86,14 @@ class SchedulingCenter:
             codebase_analysis = await software_engineer.run()
             logger.info("Codebase analysis completed")
             
+            # Add codebase analysis to the report
+            logger.info("Adding codebase analysis to report...")
+            report_engineer = self.agents["report_engineer"]
+            report_engineer.add_to_section("Smart Contract Analysis", codebase_analysis)
+            
             # Step 2: Audit Engineer identifies vulnerabilities
             logger.info("Step 2: Audit Engineer identifying vulnerabilities...")
-            audit_engineer = self.agents["audit_engineer"]
+            audit_engineer = self.agents["audit_engineer"] 
             self.findings = await audit_engineer.run(software_engineer)
             logger.info(f"Identified {len(self.findings)} potential vulnerabilities")
             
@@ -96,7 +105,6 @@ class SchedulingCenter:
             
             # Step 4: Report Engineer generates the final report
             logger.info("Step 4: Report Engineer generating report...")
-            report_engineer = self.agents["report_engineer"]
             self.report_path = await report_engineer.run(self.validated_findings)
             logger.info(f"Report generated: {self.report_path}")
             
@@ -115,7 +123,24 @@ class SchedulingCenter:
         Returns:
             Agent instance if found, None otherwise
         """
-        return self.agents.get(agent_name)
+        # Normalize agent name: convert to lowercase and replace spaces/underscores
+        normalized_name = agent_name.lower().replace(' ', '_').replace('-', '_')
+        
+        # Try direct lookup first
+        if normalized_name in self.agents:
+            return self.agents[normalized_name]
+        
+        # Try fuzzy matching if direct lookup fails
+        for name, agent in self.agents.items():
+            if name.lower().replace(' ', '_').replace('-', '_') == normalized_name:
+                return agent
+                
+        # Try to match based on the agent's class name
+        for name, agent in self.agents.items():
+            if agent.name.lower().replace(' ', '_').replace('-', '_') == normalized_name:
+                return agent
+                
+        return None
     
     async def send_message(self, from_agent: str, to_agent: str, message: str) -> str:
         """Send a message from one agent to another

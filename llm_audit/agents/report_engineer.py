@@ -7,6 +7,7 @@ generating a comprehensive Solidity smart contract audit report.
 
 import os
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
@@ -158,11 +159,12 @@ Use appropriate terminology for blockchain and Solidity context.
         response = await self.process_message(message)
         return response.content
     
-    async def generate_recommendations(self, findings: List[Dict[str, Any]]) -> str:
+    async def generate_recommendations(self, findings: List[Dict[str, Any]], additional_recommendations: Optional[str] = None) -> str:
         """Generate recommendations based on the findings
         
         Args:
             findings: List of validated findings
+            additional_recommendations: Optional additional recommendations to include
             
         Returns:
             Recommendations text
@@ -179,9 +181,11 @@ Use appropriate terminology for blockchain and Solidity context.
                 })
         
         # Generate comprehensive recommendations
-        message = f"""Please generate a comprehensive set of recommendations for Solidity smart contract security based on the following specific recommendations from the audit findings:
+        message = """Please generate a comprehensive set of recommendations for Solidity smart contract security based on the following specific recommendations from the audit findings:
 
-{recommendations}
+{}
+
+{}
 
 The recommendations should:
 1. Be organized by priority/severity
@@ -192,7 +196,10 @@ The recommendations should:
 
 Format the recommendations section with appropriate headings, bullet points, and explanations.
 Include code examples in Solidity where helpful.
-"""
+""".format(
+            recommendations,
+            "Additional security recommendations from experts:\n\n" + additional_recommendations if additional_recommendations else ""
+        )
         
         response = await self.process_message(message)
         return response.content
@@ -226,12 +233,232 @@ Keep the conclusion to 1-2 paragraphs and maintain a professional, balanced tone
         Returns:
             Complete report text
         """
+        # Define regex patterns as constants to avoid backslash issues in f-strings
+        import re
+        NUMBERED_LIST_PATTERN = r'^\d+\.'
+        EXPLOIT_PATTERN = r'exploit|poc|proof|reproduce'
+        CODE_PATTERN = r'code|implementation|function|contract'
+        
+        # Helper function to get the first line of project type or the full text
+        def get_project_type_display(project_type_text):
+            if '\n' in project_type_text:
+                return project_type_text.split('\n')[0]
+            return project_type_text
+        
         # Generate executive summary
         executive_summary = await self.generate_executive_summary(validated_findings)
         self.add_to_section("Executive Summary", executive_summary)
         
-        # Generate recommendations
-        recommendations = await self.generate_recommendations(validated_findings)
+        # Decide if we need more information about any findings
+        finding_gaps_message = """I'm generating a security audit report. For each finding, I need to decide if I have sufficient information or if I should request additional details from other agents. What questions should I ask about each finding to ensure the report is comprehensive? Consider:
+
+1. Code context that might be missing
+2. Technical impact details that may need clarification
+3. Exploitation difficulty assessment
+4. Remediation complexity
+5. Business impact
+
+Provide a general checklist of questions I should review for each finding to ensure completeness.
+"""
+        
+        response = await self.process_message(finding_gaps_message)
+        finding_checklist = response.content
+        
+        # Process the checklist into actual questions
+        checklist_items = []
+        for line in finding_gaps_message.split('\n'):
+            if line.strip().startswith('-') or ('?' in line) or re.match(NUMBERED_LIST_PATTERN, line):
+                checklist_items.append(line.strip())
+        
+        # For each finding, check if we need more information
+        for i, finding in enumerate(validated_findings):
+            if i < 5:  # Limit to first 5 findings to avoid too many iterations
+                finding_assessment_message = f"""For this finding, assess if I have sufficient information for a complete report or if I should request more details:
+                
+                ID: {finding.get('id', 'Unknown')}
+                Title: {finding.get('title', 'Unknown')}
+                Severity: {finding.get('severity', 'Unknown')}
+                Description: {finding.get('description', 'Unknown')}
+                Location: {finding.get('location', 'Unknown')}
+                
+                Using the checklist:
+                {finding_checklist}
+                
+                Respond with:
+                SUFFICIENT_INFO: <Yes/No>
+                MISSING_DETAILS: <List what's missing>
+                QUESTIONS_FOR_AGENTS: <Questions to ask, if needed>
+                """
+                
+                response = await self.process_message(finding_assessment_message)
+                finding_assessment = response.content
+                
+                need_more_info = "SUFFICIENT_INFO: No" in finding_assessment
+                
+                if need_more_info:
+                    # Extract questions
+                    questions = []
+                    in_questions = False
+                    for line in finding_assessment.split('\n'):
+                        if line.startswith('QUESTIONS_FOR_AGENTS:'):
+                            in_questions = True
+                            continue
+                        if in_questions and line.strip():
+                            questions.append(line.strip())
+                    
+                    if questions:
+                        # Determine which agent to ask based on the questions
+                        target_agent = "audit_engineer"  # Default
+                        if any(re.search(EXPLOIT_PATTERN, q, re.IGNORECASE) for q in questions):
+                            target_agent = "penetration_engineer"
+                        elif any(re.search(CODE_PATTERN, q, re.IGNORECASE) for q in questions):
+                            target_agent = "software_engineer"
+                        
+                        questions_text = "\n".join([f"- {q}" for q in questions[:3]])  # Limit to 3 questions
+                        query = f"""I'm preparing the audit report section for this finding and need additional information:
+                        
+                        Finding: {finding.get('title', 'Unknown')} ({finding.get('id', 'Unknown')})
+                        
+                        Please provide more details on:
+                        {questions_text}
+                        
+                        This will help me create a more comprehensive and accurate report section.
+                        """
+                        
+                        additional_info = await self.communicate(target_agent, query)
+                        logger.info(f"Received additional information for finding {finding.get('id', 'Unknown')}")
+                        
+                        # Add the information to the finding
+                        validated_findings[i]["additional_report_info"] = additional_info
+        
+        # Get project type information from findings if available
+        project_type = None
+        for finding in validated_findings:
+            if "project_type" in finding:
+                project_type = finding.get("project_type")
+                break
+        
+        # If project type not found in findings, determine it ourselves
+        if not project_type:
+            # Ask if we should request project type information
+            determine_project_type_message = """I'm generating a security audit report and need to determine the project type. Should I:
+            
+            1. Ask the Audit Engineer for project type information
+            2. Ask the Software Engineer directly to analyze the codebase
+            3. Try to infer it from the findings we already have
+            
+            Which approach would give me the most accurate information for the report?
+            """
+            
+            response = await self.process_message(determine_project_type_message)
+            project_type_approach = response.content
+            
+            if "ask the audit engineer" in project_type_approach.lower():
+                project_type_response = await self.communicate(
+                    "audit_engineer",
+                    "Based on your analysis of the codebase, what type of Solidity project is this? "
+                    "Please provide a concise, structured summary including project type, standards used, and key features."
+                )
+                project_type = project_type_response
+            elif "ask the software engineer" in project_type_approach.lower():
+                project_type_response = await self.communicate(
+                    "software_engineer",
+                    "Please analyze this codebase and tell me what type of Solidity project this is. "
+                    "Include the primary project category (DeFi, NFT, etc.), any standards it implements, "
+                    "and key architectural patterns. I need this for the security audit report."
+                )
+                project_type = project_type_response
+            else:
+                # Try to infer from findings
+                infer_project_type_message = f"""Based on these security findings, what type of Solidity project is this likely to be?
+                
+                Findings:
+                {[f"{f.get('id', 'Unknown')}: {f.get('title', 'Unknown')}" for f in validated_findings[:5]]}
+                
+                Please provide a structured analysis that includes:
+                1. Likely project type (DeFi, NFT, DAO, etc.)
+                2. Potential standards or protocols used
+                3. Confidence level in this assessment
+                """
+                
+                response = await self.process_message(infer_project_type_message)
+                project_type = response.content
+        
+        # Get project-specific audit checkpoints
+        if project_type:
+            logger.info(f"Generating project-specific audit checkpoints for {project_type}")
+            checkpoint_message = f"""Generate a comprehensive list of security audit checkpoints specific to this type of Solidity project:
+            
+            Project Type: {project_type}
+            
+            The checkpoints should:
+            1. Be tailored specifically to this project type
+            2. Cover the key security concerns for this project category
+            3. Include project-specific vulnerability patterns
+            4. Reference relevant industry standards or best practices
+            
+            Format the checkpoints as a markdown list with clear categories and subcategories.
+            Be specific and technical, not generic.
+            """
+            
+            checkpoints_response = await self.process_message(checkpoint_message)
+            project_specific_checkpoints = checkpoints_response.content
+        else:
+            # Fallback to generic checkpoints
+            project_specific_checkpoints = """
+            - **DeFi-Specific Checks:** Slippage protection, price oracle manipulation, flash loan vulnerabilities
+            - **Token Implementation Checks:** ERC20/ERC721/ERC1155 compliance, safe minting/burning mechanisms
+            - **Access Control Verification:** Role-based permission systems, privilege escalation vectors
+            - **Economic Security Model Analysis:** Game theory incentives, MEV protection measures
+            """
+            
+        # Ask if we need additional recommendations beyond what's in the findings
+        additional_recommendations_query = """Do we need additional security recommendations beyond addressing the specific findings? 
+        
+        Consider:
+        1. Are there architectural improvements that should be suggested?
+        2. Are there testing processes that should be implemented?
+        3. Should we recommend specific security tools or frameworks?
+        4. Are there best practices for this type of project that should be highlighted?
+        
+        If yes, which agent would be best to ask for these recommendations?
+        """
+        
+        response = await self.process_message(additional_recommendations_query)
+        recommendations_assessment = response.content
+        
+        if "yes" in recommendations_assessment.lower():
+            # Determine who to ask based on the response
+            ask_audit = "audit engineer" in recommendations_assessment.lower()
+            ask_penetration = "penetration engineer" in recommendations_assessment.lower()
+            
+            if ask_audit:
+                additional_recommendations = await self.communicate(
+                    "audit_engineer",
+                    "Beyond the specific findings, what additional security recommendations would you make for this project? "
+                    "Please focus on architectural improvements, security best practices, testing methodologies, "
+                    "and any specific tools or frameworks that would enhance security."
+                )
+                
+                # Generate recommendations based on findings and additional input
+                recommendations = await self.generate_recommendations(validated_findings, additional_recommendations)
+            elif ask_penetration:
+                additional_recommendations = await self.communicate(
+                    "penetration_engineer",
+                    "Beyond the specific vulnerabilities identified, what additional security recommendations would you make? "
+                    "Please focus on defensive coding practices, security testing, and hardening measures "
+                    "that would help prevent similar issues in the future."
+                )
+                
+                # Generate recommendations based on findings and additional input
+                recommendations = await self.generate_recommendations(validated_findings, additional_recommendations)
+            else:
+                # Just use the findings
+                recommendations = await self.generate_recommendations(validated_findings)
+        else:
+            # Just use the findings
+            recommendations = await self.generate_recommendations(validated_findings)
+            
         self.add_to_section("Recommendations", recommendations)
         
         # Generate conclusion
@@ -241,11 +468,113 @@ Keep the conclusion to 1-2 paragraphs and maintain a professional, balanced tone
         # Combine all sections into a full report
         report = f"# Solidity Smart Contract Security Audit Report\n\n"
         report += f"## Executive Summary\n\n{self.report_sections['Executive Summary']}\n\n"
+        report += f"## Audit Methodology\n\n"
+        report += f"### Project Type\n\n"
+        report += "This audit was conducted on a {} project, which informed our security assessment approach and focus areas.\n\n".format(get_project_type_display(project_type))
+        report += f"### Audit Checkpoints\n\n"
+        report += "This audit was conducted using a systematic approach that includes the following checkpoints:\n\n"
+        report += "#### Standard Security Checkpoints\n\n"
+        report += "- **Code Quality & Standards:** Review of code quality, adherence to Solidity standards, and best practices\n"
+        report += "- **Architecture Review:** Evaluation of smart contract architecture, inheritance patterns, and component interactions\n"
+        report += "- **Business Logic Review:** Analysis of business logic implementation and potential flaws\n"
+        report += "- **Security Vulnerability Assessment:** Identification of common and contract-specific security vulnerabilities\n"
+        report += "- **Gas Optimization:** Analysis of gas usage and optimization opportunities\n"
+        report += "- **Exploit Scenario Testing:** Validation of vulnerabilities through proof-of-concept exploits\n\n"
+        report += f"#### Project-Specific Security Checkpoints\n\n{project_specific_checkpoints}\n\n"
         report += f"## Smart Contract Analysis\n\n{self.report_sections['Smart Contract Analysis']}\n\n"
-        report += f"## Security Findings\n\n{self.report_sections['Security Findings']}\n\n"
+        report += f"## Security Findings\n\n"
+        
+        # Generate detailed findings section with code snippets
+        if validated_findings:
+            for finding in validated_findings:
+                report += f"### [{finding.get('severity', 'Unknown')}] {finding.get('id', 'Unknown')}: {finding.get('title', 'Unknown')}\n\n"
+                report += f"**Description:**\n\n{finding.get('description', 'No description provided.')}\n\n"
+                
+                if "location" in finding:
+                    report += f"**Location:** `{finding.get('location', 'Unknown')}`\n\n"
+                
+                # Include code snippet if available
+                if "code_snippet" in finding:
+                    report += f"**Vulnerable Code Snippet:**\n\n```solidity\n{finding.get('code_snippet', '')}\n```\n\n"
+                
+                # Include impact assessment
+                if "impact" in finding:
+                    report += f"**Impact:**\n\n{finding.get('impact', 'No impact assessment provided.')}\n\n"
+                
+                # Include recommendation
+                if "recommendation" in finding:
+                    report += f"**Recommendation:**\n\n{finding.get('recommendation', 'No recommendation provided.')}\n\n"
+                
+                # Include validation details
+                if "validation" in finding:
+                    report += f"**Validation:**\n\n{finding.get('validation', 'Not validated.')}\n\n"
+                
+                # Include additional information gathered during report generation if available
+                if "additional_report_info" in finding:
+                    report += f"**Additional Technical Details:**\n\n{finding.get('additional_report_info')}\n\n"
+                
+                report += "---\n\n"
+        else:
+            report += "No validated findings in this audit.\n\n"
         
         if self.report_sections['Proof of Concept Exploits']:
-            report += f"## Proof of Concept Exploits\n\n{self.report_sections['Proof of Concept Exploits']}\n\n"
+            report += f"## Proof of Concept Exploits\n\n"
+            # Enhanced PoC section
+            for finding in validated_findings:
+                if "proof_of_concept" in finding and finding.get("status") == "Confirmed":
+                    report += f"### PoC for {finding.get('id', 'Unknown')}: {finding.get('title', 'Unknown')}\n\n"
+                    report += "**Steps to Reproduce:**\n\n"
+                    
+                    poc_content = finding.get('proof_of_concept', '')
+                    
+                    # Try to extract steps to reproduce if they exist
+                    if "Step" in poc_content and ":" in poc_content:
+                        lines = poc_content.split("\n")
+                        in_steps = False
+                        steps = []
+                        
+                        for line in lines:
+                            if line.strip().startswith("Step") or line.strip().startswith("1."):
+                                in_steps = True
+                            
+                            if in_steps:
+                                steps.append(line)
+                                
+                                if not line.strip() and steps:  # Empty line after steps
+                                    break
+                        
+                        if steps:
+                            report += "\n".join(steps) + "\n\n"
+                    
+                    # Add the PoC code itself
+                    if "```" in poc_content:
+                        # Extract code blocks
+                        import re
+                        code_blocks = re.findall(r"```(?:solidity)?(.*?)```", poc_content, re.DOTALL)
+                        
+                        if code_blocks:
+                            report += "**Exploit Code:**\n\n"
+                            for code in code_blocks:
+                                report += f"```solidity\n{code.strip()}\n```\n\n"
+                        else:
+                            report += poc_content + "\n\n"
+                    else:
+                        report += poc_content + "\n\n"
+                    
+                    # Expected outcome
+                    report += "**Expected Outcome:**\n\n"
+                    if "Expected outcome" in poc_content:
+                        outcome_start = poc_content.find("Expected outcome")
+                        outcome_end = poc_content.find("\n\n", outcome_start)
+                        if outcome_end == -1:
+                            outcome_end = len(poc_content)
+                        
+                        expected_outcome = poc_content[outcome_start:outcome_end].strip()
+                        report += expected_outcome + "\n\n"
+                    else:
+                        report += "Successful exploitation of the vulnerability.\n\n"
+                    
+                    report += "---\n\n"
         
         if self.report_sections['Unconfirmed Findings']:
             report += f"## Unconfirmed Findings\n\n{self.report_sections['Unconfirmed Findings']}\n\n"
